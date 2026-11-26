@@ -54,6 +54,8 @@ The plugin stores JSON secrets in the extension's private state, not in `setting
 
 Saved relay settings are restored when the panel is opened again.
 
+When the relay reports usage per request, each turn shows "Est. Credits Used" the way the official line does. The plugin sends `x-gateway-usage: v1`, and the relay appends one `gateway_usage` event with the charge to the end of the stream. A relay that does not support it is unaffected and the turn still shows the elapsed time only.
+
 ## Theme and language
 
 The panel follows Kiro's light and dark theme. Text follows Kiro's language. Chinese and English are both included. `kiroGateway.language` can force one of them (`auto`, `zh`, or `en`). The button at the top of the panel switches between 中文 and EN.

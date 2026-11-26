@@ -138,6 +138,8 @@ function writeEvent(res, ev) {
     buf = encodeEvent("contextUsageEvent", ev.contextUsageEvent);
   } else if (ev.metadataEvent) {
     buf = encodeEvent("metadataEvent", ev.metadataEvent);
+  } else if (ev.meteringEvent) {
+    buf = encodeEvent("meteringEvent", ev.meteringEvent);
   }
   if (!buf) return 0;
   try { res.write(buf); } catch { return 0; }
@@ -957,6 +959,16 @@ class AnthropicStreamConverter {
   handleEvent(ev) {
     const out = [];
 
+    // A relay that bills per request can append one gateway_usage event with the charge after message_stop (the
+    // x-gateway-usage request header asks for it). Kiro sums meteringEvent frames into "Est. Credits Used";
+    // a stream without that frame shows the elapsed time only.
+    if (ev.type === "gateway_usage") {
+      if (typeof ev.credits === "number" && Number.isFinite(ev.credits) && ev.credits >= 0) {
+        out.push({ meteringEvent: { unit: "credit", unitPlural: "credits", usage: ev.credits } });
+      }
+      return out;
+    }
+
     if (ev.type === "message_start") {
       out.push({ messageMetadataEvent: { conversationId: this.conversationId } });
       const u = ev.message?.usage;
@@ -1469,6 +1481,8 @@ async function handleGenerate(req, res, bodyBuf) {
     "anthropic-version": "2023-06-01",
     accept: "text/event-stream",
     "x-client": "kiro-gateway/" + host.version(),
+    // A relay that supports it appends this request's charge to the end of the stream (gateway_usage).
+    "x-gateway-usage": "v1",
   };
 
   log("-> [中转站/KRS] " + upstreamModel + " (kiro=" + kiroModel

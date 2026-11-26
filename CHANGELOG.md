@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.12 — 2026-11-26
+
+Relay mode shows "Est. Credits Used" again. The translation never sent Kiro's `meteringEvent` frame, so a relayed turn reported the elapsed time only. Each relay request now carries `x-gateway-usage: v1`. A relay that supports it appends one `gateway_usage` event with the request's charge to the end of the stream, and that charge is passed on to Kiro as the metering frame. A relay that does not support it is unaffected: the header is ignored and no frame is sent. The panel footer still shows `2026-11-06`.
+
 ## 2.0.11 — 2026-11-06
 
 Relay mode now uses IPv4 (`family: 4`) and retries at most three times when TLS fails with `before secure TLS`. Same URL, same headers, same body. Timeouts and disconnects after the handshake are not resent. Official direct mode already did this; the chat line "无法连接中转站" was the relay path giving up on the first handshake drop. The panel footer still shows `2026-11-06`.
