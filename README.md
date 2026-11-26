@@ -66,7 +66,11 @@ Saved relay settings are restored when the panel is opened again.
 
 When the relay reports usage per request, each turn shows "Est. Credits Used" the way the official line does. The plugin sends `x-gateway-usage: v1`, and the relay appends one `gateway_usage` event with the charge to the end of the stream. A relay that does not support it is unaffected and the turn still shows the elapsed time only.
 
-The relay usage card lists the 5-hour and weekly quota with their reset times when the relay reports them (a KiroTool-style `/api/pub/quota` that carries a `windows` list). A key with limits of its own shows those windows instead. Models are grouped without regard to case.
+The relay page has three tabs. **Usage** shows today on this machine, the quota, and the relay's own records. **Connection** holds the address, the key, the connection test, and the model list. **Settings** holds the forwarding parameters and the local switches.
+
+- **Today · this machine** counts every request this window's gateway forwarded since 00:00: requests, failures, credits, input tokens (with the cached part), output tokens, and credits per hour. It updates as requests come in. On the relay route the credits are the charge the relay appends to each stream and the tokens are the upstream's own counts; a relay that sends no charge shows 0. On the API key route the credits follow the model rates and the tokens are estimated from the bytes forwarded. The same card replaces the API key page's old one.
+- **Quota** shows the 5-hour and weekly windows, each with used / limit, a bar, the reset time, and the time left. It refreshes when the tab opens, every 60 seconds while it is on screen, and 3 seconds after a request finishes. A window the relay reports no limit for shows "No limit". A seat-pool reading that did not come back shows "No reading", because the pool still has a limit. A key with limits of its own lists those windows instead. These come from a KiroTool-style `/api/pub/quota` with a `windows` list; a relay without one shows both windows as "No limit", plus its credit cap if it reports one.
+- **Relay records** is what the relay's usage endpoint reports. For a KiroTool-style relay that is its last N requests, which can span several days. Models are grouped without regard to case.
 
 ## Theme and language
 
@@ -79,6 +83,8 @@ The two buttons at the top only change the page. The route that is running keeps
 ## Development
 
 `extension.js` and `relay.js` are the extension source. `webview-ui/dist` is the built panel. The Vue project that produced that bundle is not in this repository yet.
+
+`webview-ui/dist/assets/kk-usage.js` is hand-written: the usage cards on both pages. It uses the Vue runtime from the bundle's vendor chunk. The bundle `assets/index-relayform.js` was edited by hand in four places to use it: the import on its first line, the store's `stats` handler (which keeps the new fields), the API key page's today card, and the relay page's three sub-tabs. A rebuilt bundle needs those four again.
 
 Do not commit API keys, refresh tokens, or account export files.
 

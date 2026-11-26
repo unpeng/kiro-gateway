@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.14 — 2026-11-26
+
+The relay page is split into Usage, Connection and Settings tabs, so the numbers are no longer mixed in with the forms. Usage has three cards: today on this machine, the quota, and the relay's own records. The connection and settings forms are the same as before, moved into their tabs.
+
+Today's counters now count relay requests properly. Credits on the relay route were always 0, because the relay translation never reported a charge; they now come from the charge the relay appends to each stream, the same figure Kiro shows as Est. Credits Used. Tokens on the relay route are the upstream's own counts instead of a byte estimate, split into input (with the cached part) and output. Every request and charge also lands in a per-hour bucket, shown as a chart. The API key page uses the same card. Today's numbers saved by an older version keep their totals but have no hourly split.
+
+The quota card always shows the 5-hour and weekly windows. A window the relay reports no limit for shows "No limit", with what was used when the relay says. A seat-pool reading that did not come back shows "No reading" rather than "No limit". A relay that reports no windows at all shows both as "No limit" and its credit cap, if any, on its own row. The card refreshes when the tab opens, every 60 seconds while it is on screen, and 3 seconds after a request finishes; it stops while the panel is hidden. The panel footer still shows `2026-11-06`.
+
 ## 2.0.13 — 2026-11-26
 
 An upgrade no longer gets stuck behind an old copy in another Kiro window. The window that holds the gateway ports now says its version and window name when another copy checks on it. A copy that finds an older holder asks it to let go, takes the ports within a second, and the old window shows a notice to reload. Requests already running finish, and a request that reaches the old holder on a connection kept open is passed on to the new one. A holder older than 2.0.13 cannot be asked, so the new window warns that an older version holds the ports and says to reload the other windows. Two asks at most, then a warning, so a holder that agrees and keeps the port cannot cause a loop.

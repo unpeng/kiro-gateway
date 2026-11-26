@@ -25,7 +25,7 @@ let host = {
   version: () => "0.0.0",
   stats: {
     requestStarted: () => {},
-    addOutBytes: () => {},
+    settle: () => {},
     requestFailed: () => {},
     requestFinished: () => {},
   },
@@ -1521,11 +1521,11 @@ async function handleGenerate(req, res, bodyBuf) {
   }
 
   beginEventStream(res);
-  await pumpStream(res, upstream.body, convId, upstreamModel, endOnce);
+  await pumpStream(res, upstream.body, convId, upstreamModel, endOnce, payload.length);
 }
 
 // Read the upstream SSE, translate, and write as it arrives. Nothing is written to disk and the whole body is never buffered, so the user sees character-by-character output.
-function pumpStream(res, body, convId, modelId, endOnce) {
+function pumpStream(res, body, convId, modelId, endOnce, inBytes) {
   return new Promise((resolve) => {
     const converter = new AnthropicStreamConverter(convId, modelId);
     const decoder = new StringDecoder("utf8");
@@ -1533,8 +1533,10 @@ function pumpStream(res, body, convId, modelId, endOnce) {
     let clientClosed = false;
     let finished = false;
     let outBytes = 0;
+    let credits = null; // what the relay charged for this request (its gateway_usage event), if it sent one
 
     const emit = (ev) => {
+      if (ev.meteringEvent) credits = (credits || 0) + (Number(ev.meteringEvent.usage) || 0);
       const n = writeEvent(res, ev);
       if (n) outBytes += n;
     };
@@ -1553,8 +1555,8 @@ function pumpStream(res, body, convId, modelId, endOnce) {
           res.end();
         }
       } catch {}
-      // Output volume is recorded from the bytes actually sent back, matching the accounting used by official direct mode.
-      if (outBytes) host.stats.addOutBytes(outBytes, "");
+      // Tokens come from the upstream's own usage report; the bytes sent back are the fallback when it sent none.
+      host.stats.settle({ inBytes, outBytes, usage: converter.usage, credits });
       endOnce(true);
       resolve();
     };
@@ -1713,36 +1715,62 @@ function foldModelRows(rows) {
   });
 }
 
-// Quota rows for the panel, built from the `windows` array that a KiroTool-style endpoint may carry. One row per window:
-// { kind: "hour5" | "day" | "week" | "month" | "total", scope: "key" | "pool", used, total, resetAt (epoch ms or null), over }.
-// A key that has limits of its own shows those windows. A key without any shows the 5-hour and weekly levels of the pool it
-// draws from. A server that sends no `windows` gives no rows, and the panel keeps its single "credit cap" line.
+// The quota card on the panel: one row per limit window, built from the `windows` list a KiroTool-style endpoint carries
+// (other usage styles have none). Each row is
+//   { kind: "hour5" | "day" | "week" | "month" | "total" | "cap", scope: "key" | "pool" | "relay",
+//     state: "limited" | "unlimited" | "unknown", used, total, resetAt (epoch ms or null), over }
+// The 5-hour and weekly rows are always there. A window the endpoint reports no limit for is "unlimited" (it may still
+// carry what was used). A pool window whose seat meters sent nothing back is "unknown": the pool does have a limit, this
+// reading just did not arrive. A key with limits of its own lists those windows; one without any shows the pool it draws
+// from. An endpoint with no windows at all gets the two rows as unlimited, plus its single credit cap if it has one.
 const QUOTA_KEY_ORDER = ["hour5", "day", "week", "month", "total"];
-const QUOTA_POOL_KIND = { five_hour: "hour5", week: "week" };
-function buildQuotaRows(data) {
-  const list = Array.isArray(data && data.windows) ? data.windows.filter((w) => w && typeof w === "object") : [];
-  if (!list.length) return [];
+const QUOTA_ALWAYS = ["hour5", "week"];
+const QUOTA_POOL_NAME = { hour5: "five_hour", week: "week" };
+function buildQuota(windows, creditLimit, creditUsed) {
+  const list = Array.isArray(windows) ? windows.filter((w) => w && typeof w === "object") : [];
   const num = (v) => (v === null || v === undefined || v === "" ? null : Number.isFinite(Number(v)) ? Number(v) : null);
   const at = (v) => {
     const t = Date.parse(v);
     return Number.isFinite(t) ? t : null;
   };
-  const row = (w, kind) => ({
-    kind,
-    scope: w.scope === "pool" ? "pool" : "key",
-    used: num(w.used),
-    total: num(w.total),
-    resetAt: at(w.reset_at),
-    over: w.over === true,
-  });
+  const limited = (w, kind, scope) => {
+    const used = num(w.used);
+    const total = num(w.total);
+    return { kind, scope, state: "limited", used, total, resetAt: at(w.reset_at),
+      over: w.over === true || (used !== null && used >= total) };
+  };
+  const unlimited = (kind, scope, w) => ({ kind, scope, state: "unlimited", used: w ? num(w.used) : null, total: null,
+    resetAt: null, over: false });
+  const keyWin = (kind) => list.find((w) => w.scope === "key" && w.window === kind);
+
+  if (!list.length) {
+    const rows = QUOTA_ALWAYS.map((k) => unlimited(k, "relay", null));
+    const cap = num(creditLimit);
+    if (cap > 0) {
+      const used = num(creditUsed);
+      rows.push({ kind: "cap", scope: "relay", state: "limited", used, total: cap, resetAt: null,
+        over: used !== null && used >= cap });
+    }
+    return { scope: "relay", rows };
+  }
   const own = list.filter((w) => w.scope === "key" && num(w.total) > 0);
   if (own.length) {
-    return QUOTA_KEY_ORDER.map((k) => own.find((w) => w.window === k)).filter(Boolean).map((w) => row(w, w.window));
+    const rows = [];
+    for (const k of QUOTA_KEY_ORDER) {
+      const w = own.find((x) => x.window === k);
+      if (w) rows.push(limited(w, k, "key"));
+      else if (QUOTA_ALWAYS.includes(k)) rows.push(unlimited(k, "key", keyWin(k)));
+    }
+    return { scope: "key", rows };
   }
-  return Object.keys(QUOTA_POOL_KIND)
-    .map((name) => list.find((w) => w.scope === "pool" && w.window === name))
-    .filter(Boolean)
-    .map((w) => row(w, QUOTA_POOL_KIND[w.window]));
+  const rows = QUOTA_ALWAYS.map((k) => {
+    const w = list.find((x) => x.scope === "pool" && x.window === QUOTA_POOL_NAME[k]);
+    if (!w) return unlimited(k, "pool", keyWin(k));
+    if (num(w.used) === null) return { kind: k, scope: "pool", state: "unknown", used: null, total: null, resetAt: at(w.reset_at), over: false };
+    if (num(w.total) > 0) return limited(w, k, "pool");
+    return unlimited(k, "pool", w);
+  });
+  return { scope: "pool", rows };
 }
 
 // KiroTool style: /api/pub/quota, includes per-request details, and the cache hit rate can be computed along the way.
@@ -1810,7 +1838,7 @@ async function tryPubQuota() {
     totalInputTokens: totalInput,
     totalOutputTokens: totalOutput,
     byModel: foldModelRows(modelRows),
-    quotaRows: buildQuotaRows(data),
+    windows: Array.isArray(data.windows) ? data.windows : [],
     cache,
   };
 }
@@ -1932,12 +1960,16 @@ async function fetchRelayUsage(force = false) {
       if (hit) {
         rememberUsageSource(source);
         log("[中转站] 用量接口: " + (USAGE_SOURCE_LABEL[source] || source));
+        const { windows, ...rest } = hit;
+        const quota = buildQuota(windows, hit.creditLimit, hit.totalCredits);
         return {
           ok: true,
           at: Date.now(),
           sourceLabel: USAGE_SOURCE_LABEL[source] || source,
           siteUrl: relaySiteUrl(),
-          ...hit,
+          ...rest,
+          quotaScope: quota.scope,
+          quotaRows: quota.rows,
         };
       }
       tried.push(source + " 响应结构不匹配");
@@ -2047,6 +2079,7 @@ module.exports = {
   invalidateRelayCaches,
   // For unit tests / troubleshooting
   buildAnthropicRequest,
+  buildQuota,
   AnthropicStreamConverter,
   encodeEvent,
   encodeException,

@@ -1784,7 +1784,15 @@ const STATS_PUSH_MS = 250;     // throttle for the streaming byte counter
 const CHARS_PER_TOKEN = 4;     // rough tokenizer ratio for the estimate
 
 // Stats count only "today": day records which local date this batch of counters belongs to, and they zero themselves after midnight.
-let _stats = { requests: 0, errors: 0, tokens: 0, credits: 0, since: 0, day: "" };
+// tokens = inTokens + outTokens. inTokens counts the whole prompt, cached part included; cacheTokens is that cached part.
+// hours[h] is what happened in local hour h of `day`: requests started and credits charged.
+function emptyHours() {
+  return Array.from({ length: 24 }, () => ({ requests: 0, credits: 0 }));
+}
+function freshStats(since, day) {
+  return { requests: 0, errors: 0, tokens: 0, inTokens: 0, outTokens: 0, cacheTokens: 0, credits: 0, since, day, hours: emptyHours() };
+}
+let _stats = freshStats(0, "");
 let _statsInflight = 0; // open generation calls right now
 // Per-key breakdown ("personal usage" in the panel): the same live counters, but
 // attributed to the key that actually served the request. Stored under a short
@@ -1852,7 +1860,7 @@ function startOfToday() {
 function ensureToday() {
   const today = todayKey();
   if (_stats.day === today) return false;
-  _stats = { requests: 0, errors: 0, tokens: 0, credits: 0, since: startOfToday(), day: today };
+  _stats = freshStats(startOfToday(), today);
   _keyStats = {};
   if (_statsFlushTimer) { clearTimeout(_statsFlushTimer); _statsFlushTimer = null; }
   persistStatsNow();
@@ -1878,14 +1886,25 @@ function stopDailyReset() {
 }
 function loadStats() {
   const s = (extContext && extContext.globalState.get(STATS_STATE_KEY)) || null;
+  const hours = emptyHours();
+  if (s && Array.isArray(s.hours)) {
+    s.hours.slice(0, 24).forEach((h, i) => {
+      hours[i] = { requests: posNum(h && h.requests), credits: posNum(h && h.credits) };
+    });
+  }
   _stats = {
     requests: posNum(s && s.requests),
     errors: posNum(s && s.errors),
     tokens: posNum(s && s.tokens),
+    // Saved before 2.0.14: no split and no hours. Those stay at zero for the rest of that day.
+    inTokens: posNum(s && s.inTokens),
+    outTokens: posNum(s && s.outTokens),
+    cacheTokens: posNum(s && s.cacheTokens),
     credits: posNum(s && s.credits),
     since: posNum(s && s.since) || startOfToday(),
     // Data saved by an older version has no day field. Treat it as "not today"; it is cleared after load.
     day: String((s && s.day) || ""),
+    hours,
   };
   const per = (extContext && extContext.globalState.get(KEY_STATS_STATE_KEY)) || null;
   if (per && typeof per === "object") {
@@ -1918,7 +1937,11 @@ function statsSnapshot() {
     requests: Math.round(_stats.requests),
     errors: Math.round(_stats.errors),
     tokens: Math.round(_stats.tokens),
+    inTokens: Math.round(_stats.inTokens),
+    outTokens: Math.round(_stats.outTokens),
+    cacheTokens: Math.round(_stats.cacheTokens),
     credits: Math.round(_stats.credits * 100) / 100,
+    hours: _stats.hours.map((h) => ({ requests: Math.round(h.requests), credits: Math.round(h.credits * 10000) / 10000 })),
     since: _stats.since,
     inflight: _statsInflight,
   };
@@ -2054,6 +2077,8 @@ function statsRequestStarted(inBytes, key) {
   const add = posNum(inBytes) / CHARS_PER_TOKEN;
   _stats.requests += 1;
   _stats.tokens += add;
+  _stats.inTokens += add;
+  _stats.hours[new Date().getHours()].requests += 1;
   _statsInflight += 1;
   if (!_stats.since) _stats.since = Date.now();
   const b = keyBucket(key);
@@ -2071,6 +2096,7 @@ function statsAddOutBytes(n, key) {
   if (!bytes) return;
   const add = bytes / CHARS_PER_TOKEN;
   _stats.tokens += add;
+  _stats.outTokens += add;
   const b = keyBucket(key);
   if (b) b.tokens += add;
   flushStatsSoon();
@@ -2088,8 +2114,42 @@ function statsAddCredits(op, modelId, key) {
   if (!BILLED_OP_RE.test(String(op || ""))) return;
   const rate = creditRateFor(modelId);
   _stats.credits += rate;
+  _stats.hours[new Date().getHours()].credits += rate;
   const b = keyBucket(key);
   if (b) b.credits += rate;
+  flushStatsSoon();
+  pushStatsNow();
+}
+// Relay mode: one finished request, with what the relay reported for it. `usage` holds the upstream token counts
+// (inputTokens without the cached part, cacheReadTokens, cacheCreationTokens, outputTokens) and `credits` the charge the
+// relay appended at the end of the stream. When the upstream reported tokens, they replace the byte estimate made
+// at the start; otherwise the estimate stays and the streamed bytes count as output. A relay that sends no charge
+// leaves the credits alone.
+function statsSettleRelay({ inBytes, outBytes, usage, credits } = {}) {
+  ensureToday();
+  const u = usage || {};
+  const cacheRead = posNum(u.cacheReadTokens);
+  const realIn = posNum(u.inputTokens) + cacheRead + posNum(u.cacheCreationTokens);
+  const realOut = posNum(u.outputTokens);
+  if (realIn || realOut) {
+    const estIn = posNum(inBytes) / CHARS_PER_TOKEN;
+    const nextIn = Math.max(0, _stats.inTokens - estIn) + realIn;
+    // Adjust the total by the same difference rather than recomputing it, so tokens counted before the split
+    // existed (saved by an older version earlier today) are kept.
+    _stats.tokens = Math.max(0, _stats.tokens + (nextIn - _stats.inTokens) + realOut);
+    _stats.inTokens = nextIn;
+    _stats.outTokens += realOut;
+    _stats.cacheTokens += cacheRead;
+  } else if (posNum(outBytes)) {
+    const add = posNum(outBytes) / CHARS_PER_TOKEN;
+    _stats.outTokens += add;
+    _stats.tokens += add;
+  }
+  const c = Number(credits);
+  if (Number.isFinite(c) && c > 0) {
+    _stats.credits += c;
+    _stats.hours[new Date().getHours()].credits += c;
+  }
   flushStatsSoon();
   pushStatsNow();
 }
@@ -2099,7 +2159,7 @@ function statsRequestFinished() {
 }
 // Manual reset: clear today's counters. The owning date stays today.
 async function resetStats() {
-  _stats = { requests: 0, errors: 0, tokens: 0, credits: 0, since: Date.now(), day: todayKey() };
+  _stats = freshStats(Date.now(), todayKey());
   _keyStats = {};
   if (_statsFlushTimer) { clearTimeout(_statsFlushTimer); _statsFlushTimer = null; }
   if (extContext) {
@@ -7933,7 +7993,7 @@ async function activate(context) {
     applyPromptPrefs,
     stats: {
       requestStarted: statsRequestStarted,
-      addOutBytes: statsAddOutBytes,
+      settle: statsSettleRelay,
       requestFailed: statsRequestFailed,
       requestFinished: statsRequestFinished,
     },
