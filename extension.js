@@ -76,6 +76,22 @@ const REPO_URL = "https://github.com/Tes-bo/kiro-gateway";
 function currentVersion() {
   try { return String(require("./package.json").version || "0.0.0"); } catch { return "0.0.0"; }
 }
+// The date of the running version, from its heading in the changelog that ships with it ("## 2.0.14 — 2026-11-26").
+// The packager may lowercase the file name. Empty when the file or the heading is missing.
+let _releaseDate = null;
+function currentReleaseDate() {
+  if (_releaseDate !== null) return _releaseDate;
+  _releaseDate = "";
+  const v = currentVersion().replace(/\./g, "\\.");
+  const re = new RegExp("^##\\s+v?" + v + "\\s+\\S+\\s+(\\d{4}-\\d{2}-\\d{2})\\s*$", "m");
+  for (const name of ["CHANGELOG.md", "changelog.md"]) {
+    try {
+      const m = re.exec(require("fs").readFileSync(require("path").join(__dirname, name), "utf8"));
+      if (m) { _releaseDate = m[1]; break; }
+    } catch {}
+  }
+  return _releaseDate;
+}
 function cleanVersion(value) {
   return String(value || "").trim().replace(/^v/i, "");
 }
@@ -7037,6 +7053,7 @@ class ControlPanelProvider {
       gateway: gatewayRuntimeState(),
       gatewayPlanes: gatewayPlaneStates(),
       version: currentVersion(),
+      releaseDate: currentReleaseDate(),
       repoUrl: REPO_URL,
     });
     this.pushStats();

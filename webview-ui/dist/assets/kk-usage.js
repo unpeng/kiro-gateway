@@ -396,7 +396,11 @@ export const KkQuota = {
         body = [h("div", { class: "kku-msg" }, T("中转站还没配置好，先去「连接」填地址和 Key。"))];
       } else if (u.done && !u.ok) {
         const msg = (u.payload && u.payload.message) || "";
-        body = [h("div", { class: "kku-msg bad" }, [T("拉不到额度：") + msg + " ", h("button", { class: "kku-link", onClick: () => st.fetchRelayUsage(true) }, T("重试"))])];
+        const tried = Array.isArray(u.payload && u.payload.tried) ? u.payload.tried : [];
+        body = [
+          h("div", { class: "kku-msg bad" }, [T("拉不到额度：") + msg + " ", h("button", { class: "kku-link", onClick: () => st.fetchRelayUsage(true) }, T("重试"))]),
+          tried.length ? h("div", { class: "kku-q-s", style: { display: "block", marginTop: "6px" } }, tried.join(" · ")) : null,
+        ];
       } else if (!p) {
         body = [h("div", { class: "kku-msg" }, T("正在拉取…"))];
       } else {

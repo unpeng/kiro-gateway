@@ -1839,6 +1839,9 @@ async function tryPubQuota() {
     totalOutputTokens: totalOutput,
     byModel: foldModelRows(modelRows),
     windows: Array.isArray(data.windows) ? data.windows : [],
+    // Only llmgateway sends `windows`, and it serves its user portal at /portal/ui. Other KiroTool-style relays keep
+    // the site root.
+    siteUrl: Array.isArray(data.windows) ? relaySiteUrl() + "/portal/ui" : relaySiteUrl(),
     cache,
   };
 }
@@ -1954,6 +1957,7 @@ async function fetchRelayUsage(force = false) {
     : USAGE_PROBE_ORDER;
 
   const tried = [];
+  let rejected = 0; // HTTP status when the relay turned the key away
   for (const source of order) {
     try {
       const hit = await USAGE_PROBES[source]();
@@ -1975,14 +1979,18 @@ async function fetchRelayUsage(force = false) {
       tried.push(source + " 响应结构不匹配");
     } catch (e) {
       tried.push(source + " " + shortErr(e));
+      // A 401 / 403 from the style that answered last time, or from the first style tried, means the key itself was
+      // refused. A 401 from a later style proves nothing: a relay may answer every path it does not serve that way.
+      const status = Number((String(e && e.message || "").match(/^HTTP\s+(\d+)/i) || [])[1]);
+      if (!rejected && source === order[0] && (status === 401 || status === 403)) rejected = status;
     }
   }
   clearUsageSource();
-  return {
-    ok: false,
-    message: "没能识别中转站的用量接口格式",
-    tried,
-  };
+  const message = rejected
+    ? "中转站拒绝了这把 Key（HTTP " + rejected + "），请到「连接」检查 Key"
+    : "没能识别中转站的用量接口格式";
+  log("!! [中转站] 用量查询失败: " + message + " · " + tried.join(" · "));
+  return { ok: false, message, tried };
 }
 
 function shortErr(e) {
