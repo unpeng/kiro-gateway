@@ -68,6 +68,8 @@ const relay = require("./relay.js");
 const CONFIG_NS = "kiroGateway";
 const HEALTH_PATH = "/__kiro_key_health";
 const HEALTH_MARKER = "kiro-key-ok";
+const YIELD_PATH = "/__kiro_key_yield";
+const YIELD_HEADER = "x-kiro-gateway-yield";
 const REPO_URL = "https://github.com/Tes-bo/kiro-gateway";
 // Current extension version, read from the shipped package.json (extension.js
 // sits next to it both in dev and inside the packaged VSIX).
@@ -3222,11 +3224,6 @@ function forwardOfficialKrsRequest(req, res, bodyBuf) {
 const SNIFF_CAP = 64 * 1024;
 function makeProxyHandler(label, baseFn, opts = {}) {
   return function handle(req, res) {
-    if (req.url === HEALTH_PATH) {
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end(HEALTH_MARKER);
-      return;
-    }
     const apiKey = getApiKey();
     if (!apiKey) {
       res.writeHead(401, { "Content-Type": "application/json" });
@@ -3376,11 +3373,6 @@ const NO_INTERRUPT_WAIT_MS = 2500;
 // Automatic switching can be turned off in settings. Off, it is strictly "use only the selected one".
 function makeKrsHandler() {
   return function handle(req, res) {
-    if (req.url === HEALTH_PATH) {
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end(HEALTH_MARKER);
-      return;
-    }
     markProxyHit("KRS", req);
     // Which key to start with is decided by pickStartKey (the currently selected one first, and if it is unusable, move on and
     // pick a healthy one). Here we only confirm that at least one is configured.
@@ -4236,11 +4228,6 @@ function makeCpsHandler() {
     },
   });
   return function handle(req, res) {
-    if (req.url === HEALTH_PATH) {
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end(HEALTH_MARKER);
-      return;
-    }
     if (!getApiKey()) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ message: "Kiro Gateway: no API key configured." }));
@@ -4250,6 +4237,95 @@ function makeCpsHandler() {
     // Every control-plane operation takes the same path: swap credentials, forward unchanged, and send the response back unchanged.
     passthrough(req, res);
   };
+}
+
+// ---------------------------------------------------------------------------
+// Several Kiro windows, one gateway
+//
+// Every window starts its own copy of this extension, but the ports are fixed, so only one copy can hold them. The others stand by
+// and take over when the holder goes away. Kiro sends every request to the holder, so the version that is actually running is the
+// holder's, not the one installed on disk. After an upgrade the old holder keeps serving until its window is reloaded, and a window
+// that was reloaded just stands by behind it. That is what the two notices below are for, and what the yield request avoids.
+//
+// What the gateway ports answer, besides the proxied traffic:
+//   GET  HEALTH_PATH  "kiro-key-ok" and then one JSON object: { version, window, pid, canYield }.
+//                     Copies older than 2.0.13 answer the bare marker. No JSON therefore means "older than 2.0.13".
+//   POST YIELD_PATH   a newer copy asks the holder to give the port up. The holder agrees only when the asker's version is strictly
+//                     greater than its own. It then closes its listener, finishes the requests already in flight, passes any later
+//                     request on an already open connection to the new holder, and stands by.
+//                     It never asks back, so two windows cannot pass the port to each other in a loop.
+// ---------------------------------------------------------------------------
+// -1 / 0 / 1. Dotted numbers only; a "-pre" suffix is ignored, and a missing or unreadable version counts as 0.0.0.
+function compareVersions(a, b) {
+  const parse = (v) => cleanVersion(v).split("-")[0].split(".").map((n) => parseInt(n, 10) || 0);
+  const x = parse(a);
+  const y = parse(b);
+  for (let i = 0; i < Math.max(x.length, y.length, 3); i++) {
+    const d = (x[i] || 0) - (y[i] || 0);
+    if (d) return d < 0 ? -1 : 1;
+  }
+  return 0;
+}
+// The folders open in this window, which is the name a user recognizes the window by.
+function gatewayWindowName() {
+  try {
+    const folders = (vscode.workspace.workspaceFolders || []).map((f) => f.name).filter(Boolean);
+    return (folders.length ? folders.join(", ") : vscode.workspace.name || "").slice(0, 80);
+  } catch {
+    return "";
+  }
+}
+// What this copy tells another copy that asks.
+function holderInfo() {
+  return { version: currentVersion(), window: gatewayWindowName(), pid: process.pid, canYield: true };
+}
+function localized(zh, en) {
+  return uiLocale() === "en" ? en : zh;
+}
+// Shown in the window that gave its port up. Both planes (KRS and CPS) hand over together, so it is shown once.
+let _yieldNoticeShown = false;
+function noticeYielded(newer) {
+  if (_yieldNoticeShown) return;
+  _yieldNoticeShown = true;
+  const mine = currentVersion();
+  const reload = tr("重新加载窗口");
+  const text = localized(
+    "Kiro Gateway：另一个窗口的新版本（" + newer + "）已接管网关端口。本窗口运行的是 " + mine
+      + "，已转入待命，Kiro 的请求由新版本转发，不受影响。重新加载本窗口后会换成新版本。",
+    "Kiro Gateway: a newer version (" + newer + ") in another window has taken over the gateway ports. This window runs "
+      + mine + " and is on standby now. Kiro's requests are forwarded by the newer one, so nothing is interrupted. "
+      + "Reload this window to switch it to the new version."
+  );
+  vscode.window.showInformationMessage(text, reload).then((pick) => {
+    if (pick === reload) vscode.commands.executeCommand("workbench.action.reloadWindow");
+  });
+}
+// Shown in the window that is stuck behind an older holder it could not move. Once per holder: both planes see the same one.
+const _staleWarned = new Set();
+function warnStaleHolder(port, theirs, info) {
+  const key = info ? "pid:" + info.pid + "@" + theirs : "legacy";
+  if (_staleWarned.has(key)) return;
+  _staleWarned.add(key);
+  const mine = currentVersion();
+  let zh;
+  let en;
+  if (info) {
+    const where = info.window ? "（" + info.window + "）" : "";
+    zh = "Kiro Gateway：网关端口 " + port + " 被另一个窗口" + where + "里的 " + theirs + " 持有，它没有让位。本窗口运行的 "
+      + mine + " 只能待命。请重新加载那个窗口。";
+    en = "Kiro Gateway: port " + port + " is held by version " + theirs + " in another window"
+      + (info.window ? " (" + info.window + ")" : "") + ", and it did not give the port up. This window runs " + mine
+      + " but can only stand by. Reload that window.";
+  } else {
+    zh = "Kiro Gateway：网关端口 " + port + " 被另一个 Kiro 窗口里的旧版本（2.0.13 之前，认不出是哪个窗口）持有。本窗口运行的 "
+      + mine + " 只能待命，新功能不会生效。请重新加载其他 Kiro 窗口（或关闭它们），本窗口会自动接管。";
+    en = "Kiro Gateway: port " + port + " is held by an older version (before 2.0.13, so the window cannot be identified) in "
+      + "another Kiro window. This window runs " + mine + " but can only stand by, so its new features do not apply. "
+      + "Reload (or close) the other Kiro windows and this one takes over by itself.";
+  }
+  log("!! [" + port + "] " + (info ? "holder " + theirs + " in window \"" + (info.window || "?") + "\"" : "holder older than 2.0.13")
+    + " did not hand the port over; this window (" + mine + ") stays on standby");
+  vscode.window.showWarningMessage(localized(zh, en));
 }
 
 // ---------------------------------------------------------------------------
@@ -4264,6 +4340,9 @@ class ProxyServer {
     this.pending = null;
     this.stopped = false;
     this.retryTimer = null;
+    // How many times this copy has asked the current holder to let go. A holder that says yes and still keeps the port gets two
+    // tries, then a warning, so the two of them cannot loop forever.
+    this.yieldAsks = 0;
     // Who the port actually belongs to. The panel's top bar uses this to tell four cases apart:
     //   listening this window bound it, and requests are forwarded by this window
     //   standby   the port is held by the same kind of gateway in another Kiro window — this is normal sharing across windows,
@@ -4280,7 +4359,7 @@ class ProxyServer {
   }
   _tryBind() {
     if (this.stopped) return;
-    const srv = http.createServer(this.handler);
+    const srv = http.createServer((req, res) => this._dispatch(srv, req, res));
     this.pending = srv;
     srv.on("error", (e) => {
       if (this.pending === srv) this.pending = null;
@@ -4289,12 +4368,13 @@ class ProxyServer {
         log("!! [" + this.label + "] port " + this.port + " is in use; checking whether it is another healthy gateway");
         // Is the occupant one of our own kind? If so, another Kiro window has already brought the gateway up, and this window
         // should stand by. It should not be reported to the user as a fault. Only when it is not one of ours is it a real conflict.
-        this.isReachable().then((sameKind) => {
+        this.probeHolder().then((holder) => {
           if (this.stopped || this.server) return;
-          this.state = sameKind ? "standby" : "conflict";
+          this.state = holder.sameKind ? "standby" : "conflict";
           log("[" + this.label + "] 端口 " + this.port
-            + (sameKind ? " 由另一个窗口的网关持有，本窗口待命" : " 被无关程序占用"));
+            + (holder.sameKind ? " 由另一个窗口的网关持有，本窗口待命" : " 被无关程序占用"));
           if (panelProvider) panelProvider.pushState();
+          if (holder.sameKind) return this._reconcileWithHolder(holder.info);
         }).catch(() => {});
       } else {
         this.state = "conflict";
@@ -4316,6 +4396,10 @@ class ProxyServer {
       this.state = "listening";
       log("[" + this.label + "] listening on 127.0.0.1:" + this.port
         + (wasStandby ? "（已从另一个窗口接管）" : ""));
+      // Holding the port again, so a later hand-over or stale holder is news again.
+      _staleWarned.clear();
+      _yieldNoticeShown = false;
+      this.yieldAsks = 0;
       if (panelProvider) panelProvider.pushState();
     });
   }
@@ -4326,21 +4410,168 @@ class ProxyServer {
       this._tryBind();
     }, 3000);
   }
-  async isReachable() {
-    if (this.server) return true;
+  // Every request on this port comes through here first. The health probe and the yield request are answered here, so the three
+  // proxy handlers and the two relay handlers do not each carry their own copy.
+  _dispatch(srv, req, res) {
+    const url = String(req.url || "").split("?")[0];
+    if (url === HEALTH_PATH) {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end(HEALTH_MARKER + " " + JSON.stringify(holderInfo()));
+      return;
+    }
+    if (url === YIELD_PATH) {
+      this._onYieldRequest(srv, req, res);
+      return;
+    }
+    // A listener that has given its port up finishes the requests already in flight, but a client can still send its next
+    // request down a connection it kept open. This copy must not answer that one: it is older than the holder.
+    if (srv._yielded) {
+      this._passToHolder(req, res);
+      return;
+    }
+    this.handler(req, res);
+  }
+  // Hand a late request over to whoever holds the port now, byte for byte, and close the connection behind it so the client
+  // reaches the holder directly from then on.
+  _passToHolder(req, res) {
+    const headers = { ...req.headers, connection: "close" };
+    delete headers["keep-alive"];
+    const up = http.request(
+      { host: "127.0.0.1", port: this.port, path: req.url, method: req.method, headers, agent: false },
+      (r) => {
+        const back = { ...r.headers, connection: "close" };
+        delete back["keep-alive"];
+        res.writeHead(r.statusCode || 502, back);
+        try { res.socket.setNoDelay(true); } catch {}
+        r.pipe(res);
+      }
+    );
+    up.on("error", () => {
+      if (!res.headersSent) res.writeHead(502, { Connection: "close" });
+      res.end();
+    });
+    // The client gave up (stop button, window reload): let the holder see that too.
+    res.on("close", () => up.destroy());
+    req.pipe(up);
+  }
+  _onYieldRequest(srv, req, res) {
+    const reply = (status, obj, done) => {
+      res.writeHead(status, { "Content-Type": "application/json", Connection: "close" });
+      res.end(JSON.stringify(obj), done);
+    };
+    // A web page can POST to 127.0.0.1 but can neither add a custom header (that needs a preflight this server never answers) nor
+    // omit its Origin. Requiring both keeps a page from making the gateway let go of its port.
+    if (req.method !== "POST" || !req.headers[YIELD_HEADER] || req.headers.origin) {
+      reply(403, { ok: false, reason: "forbidden" });
+      return;
+    }
+    const chunks = [];
+    let size = 0;
+    req.on("data", (c) => { size += c.length; if (size <= 1024) chunks.push(c); });
+    req.on("end", () => {
+      let asker = "";
+      try { asker = String(JSON.parse(Buffer.concat(chunks).toString("utf8")).version || ""); } catch {}
+      if (srv !== this.server || compareVersions(asker, currentVersion()) <= 0) {
+        reply(409, { ok: false, reason: "not-newer", version: currentVersion() });
+        return;
+      }
+      // Answer first, then let go: the asker binds the moment it reads "ok".
+      reply(200, { ok: true, version: currentVersion() }, () => this._yieldPort(srv, asker));
+    });
+  }
+  _yieldPort(srv, newer) {
+    if (this.stopped || srv !== this.server) return;
+    srv._yielded = true;
+    this.server = null;
+    this.state = "standby";
+    log("[" + this.label + "] 端口 " + this.port + " 已让给更新的版本 " + newer + "，本窗口（" + currentVersion() + "）转入待命");
+    try { srv.close(); } catch {}
+    try { if (srv.closeIdleConnections) srv.closeIdleConnections(); } catch {}
+    noticeYielded(newer);
+    if (panelProvider) panelProvider.pushState();
+    // If the asker never binds, this copy gets the port back on the next retry.
+    this._scheduleRetry();
+  }
+  // Ask whatever holds the port who it is. sameKind: it is one of our gateways. info: what it said about itself, or null for a
+  // copy older than 2.0.13, which answers the bare marker.
+  probeHolder() {
+    if (this.server) return Promise.resolve({ sameKind: true, info: holderInfo() });
     return new Promise((resolve) => {
+      const none = { sameKind: false, info: null };
       const req = http.request(
-        { host: "127.0.0.1", port: this.port, path: HEALTH_PATH, method: "GET", timeout: 1000 },
+        { host: "127.0.0.1", port: this.port, path: HEALTH_PATH, method: "GET", timeout: 1000, agent: false },
         (r) => {
           const c = [];
           r.on("data", (d) => c.push(d));
-          r.on("end", () => resolve(Buffer.concat(c).toString("utf8").includes(HEALTH_MARKER)));
+          r.on("end", () => {
+            const text = Buffer.concat(c).toString("utf8");
+            const at = text.indexOf(HEALTH_MARKER);
+            if (at < 0) { resolve(none); return; }
+            let info = null;
+            try {
+              const parsed = JSON.parse(text.slice(at + HEALTH_MARKER.length));
+              if (parsed && typeof parsed === "object") info = parsed;
+            } catch {}
+            resolve({ sameKind: true, info });
+          });
+        }
+      );
+      req.on("error", () => resolve(none));
+      req.on("timeout", () => { req.destroy(); resolve(none); });
+      req.end();
+    });
+  }
+  async isReachable() {
+    return (await this.probeHolder()).sameKind;
+  }
+  // Runs each time this window finds another gateway on its port. A holder older than this window is asked to let go. One that
+  // cannot be asked, or does not agree, is named in a warning so the user knows which window to reload.
+  async _reconcileWithHolder(info) {
+    const theirs = info && info.version ? String(info.version) : "";
+    if (compareVersions(theirs, currentVersion()) >= 0) return; // same or newer: ordinary sharing, nothing to say
+    if (info && info.canYield && this.yieldAsks < 2) {
+      this.yieldAsks++;
+      if (await this._askToYield()) {
+        if (this.stopped || this.server) return;
+        log("[" + this.label + "] 已请旧版本 " + theirs + " 让出端口 " + this.port + "，马上接管");
+        this._retrySoon(300);
+        return;
+      }
+    }
+    if (this.stopped || this.server) return;
+    warnStaleHolder(this.port, theirs, info);
+  }
+  _askToYield() {
+    return new Promise((resolve) => {
+      const payload = JSON.stringify({ version: currentVersion() });
+      const req = http.request(
+        {
+          host: "127.0.0.1", port: this.port, path: YIELD_PATH, method: "POST", timeout: 1500, agent: false,
+          headers: {
+            "content-type": "application/json",
+            "content-length": Buffer.byteLength(payload),
+            [YIELD_HEADER]: "1",
+            connection: "close",
+          },
+        },
+        (r) => {
+          r.on("error", () => resolve(false));
+          r.on("end", () => resolve(r.statusCode === 200));
+          r.resume();
         }
       );
       req.on("error", () => resolve(false));
       req.on("timeout", () => { req.destroy(); resolve(false); });
-      req.end();
+      req.end(payload);
     });
+  }
+  _retrySoon(ms) {
+    if (this.stopped) return;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      this._tryBind();
+    }, ms);
   }
   async waitUntilReachable(timeoutMs = 6000) {
     const deadline = Date.now() + timeoutMs;
@@ -7698,8 +7929,6 @@ async function activate(context) {
     isEnabled,
     log,
     version: currentVersion,
-    healthPath: HEALTH_PATH,
-    healthMarker: HEALTH_MARKER,
     markProxyHit,
     applyPromptPrefs,
     stats: {

@@ -1296,11 +1296,6 @@ function writeSetupMessage(res, convId, msg) {
 function makeRelayKrsHandler() {
   return function handle(req, res) {
     const urlRaw = req.url || "/";
-    if (urlRaw === host.healthPath) {
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end(host.healthMarker);
-      return;
-    }
     try { host.markProxyHit("KRS", req); } catch {}
 
     const method = req.method || "GET";
@@ -1610,11 +1605,6 @@ function pumpStream(res, body, convId, modelId, endOnce) {
 function makeRelayCpsHandler() {
   return function handle(req, res) {
     const urlRaw = req.url || "/";
-    if (urlRaw === host.healthPath) {
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end(host.healthMarker);
-      return;
-    }
     req.resume(); // The control-plane request body is unused; drain it so the connection does not hang
     if (!host.isEnabled()) {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -1693,6 +1683,68 @@ const USAGE_SOURCE_LABEL = {
   billing: "OpenAI 兼容计费接口",
 };
 
+// Group usage rows by model name without regard to case: "GLM-5.4" and "glm-5.4" are one model that different clients spell
+// differently. The shown name is the spelling with the most requests; on a tie, the one seen first.
+// Each row is { model, requests, inputTokens, outputTokens, credits }.
+function foldModelRows(rows) {
+  const groups = new Map();
+  for (const r of rows) {
+    const name = String(r && r.model != null ? r.model : "").trim() || "unknown";
+    const key = name.toLowerCase();
+    let g = groups.get(key);
+    if (!g) {
+      g = { model: name, requests: 0, inputTokens: 0, outputTokens: 0, credits: 0, spellings: new Map() };
+      groups.set(key, g);
+    }
+    const reqs = Number(r.requests) || 0;
+    g.requests += reqs;
+    g.inputTokens += Number(r.inputTokens) || 0;
+    g.outputTokens += Number(r.outputTokens) || 0;
+    g.credits += Number(r.credits) || 0;
+    g.spellings.set(name, (g.spellings.get(name) || 0) + reqs);
+  }
+  return [...groups.values()].map(({ spellings, ...g }) => {
+    let best = g.model;
+    let bestN = -1;
+    for (const [name, n] of spellings) {
+      if (n > bestN) { best = name; bestN = n; }
+    }
+    return { ...g, model: best };
+  });
+}
+
+// Quota rows for the panel, built from the `windows` array that a KiroTool-style endpoint may carry. One row per window:
+// { kind: "hour5" | "day" | "week" | "month" | "total", scope: "key" | "pool", used, total, resetAt (epoch ms or null), over }.
+// A key that has limits of its own shows those windows. A key without any shows the 5-hour and weekly levels of the pool it
+// draws from. A server that sends no `windows` gives no rows, and the panel keeps its single "credit cap" line.
+const QUOTA_KEY_ORDER = ["hour5", "day", "week", "month", "total"];
+const QUOTA_POOL_KIND = { five_hour: "hour5", week: "week" };
+function buildQuotaRows(data) {
+  const list = Array.isArray(data && data.windows) ? data.windows.filter((w) => w && typeof w === "object") : [];
+  if (!list.length) return [];
+  const num = (v) => (v === null || v === undefined || v === "" ? null : Number.isFinite(Number(v)) ? Number(v) : null);
+  const at = (v) => {
+    const t = Date.parse(v);
+    return Number.isFinite(t) ? t : null;
+  };
+  const row = (w, kind) => ({
+    kind,
+    scope: w.scope === "pool" ? "pool" : "key",
+    used: num(w.used),
+    total: num(w.total),
+    resetAt: at(w.reset_at),
+    over: w.over === true,
+  });
+  const own = list.filter((w) => w.scope === "key" && num(w.total) > 0);
+  if (own.length) {
+    return QUOTA_KEY_ORDER.map((k) => own.find((w) => w.window === k)).filter(Boolean).map((w) => row(w, w.window));
+  }
+  return Object.keys(QUOTA_POOL_KIND)
+    .map((name) => list.find((w) => w.scope === "pool" && w.window === name))
+    .filter(Boolean)
+    .map((w) => row(w, QUOTA_POOL_KIND[w.window]));
+}
+
 // KiroTool style: /api/pub/quota, includes per-request details, and the cache hit rate can be computed along the way.
 async function tryPubQuota() {
   const key = relayApiKey();
@@ -1700,7 +1752,7 @@ async function tryPubQuota() {
   if (!data || (data.credit_limit === undefined && data.credit_used === undefined)) return null;
 
   const logs = Array.isArray(data.logs) ? data.logs : [];
-  const modelMap = new Map();
+  const modelRows = [];
   let totalInput = 0;
   let totalOutput = 0;
   let totalCacheRead = 0;
@@ -1724,12 +1776,7 @@ async function tryPubQuota() {
       totalCacheRead += Number(row.cache_tokens) || 0;
       cacheRecords++;
     }
-    const cur = modelMap.get(model) || { model, requests: 0, inputTokens: 0, outputTokens: 0, credits: 0 };
-    cur.requests++;
-    cur.inputTokens += inTok;
-    cur.outputTokens += outTok;
-    cur.credits += credits;
-    modelMap.set(model, cur);
+    modelRows.push({ model, requests: 1, inputTokens: inTok, outputTokens: outTok, credits });
   }
 
   // Hit rate = cache reads / total input. Which denominator to use depends on whether the upstream prompt_tokens already includes cache
@@ -1762,7 +1809,8 @@ async function tryPubQuota() {
     totalRequests: logs.length,
     totalInputTokens: totalInput,
     totalOutputTokens: totalOutput,
-    byModel: [...modelMap.values()],
+    byModel: foldModelRows(modelRows),
+    quotaRows: buildQuotaRows(data),
     cache,
   };
 }
@@ -1817,7 +1865,7 @@ async function tryKiro2cc() {
     totalRequests: Number(data.totalRequests) || 0,
     totalInputTokens: Number(data.totalInputTokens) || 0,
     totalOutputTokens: Number(data.totalOutputTokens) || 0,
-    byModel,
+    byModel: foldModelRows(byModel),
     cache: null,
   };
 }

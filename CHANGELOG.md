@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.13 — 2026-11-26
+
+An upgrade no longer gets stuck behind an old copy in another Kiro window. The window that holds the gateway ports now says its version and window name when another copy checks on it. A copy that finds an older holder asks it to let go, takes the ports within a second, and the old window shows a notice to reload. Requests already running finish, and a request that reaches the old holder on a connection kept open is passed on to the new one. A holder older than 2.0.13 cannot be asked, so the new window warns that an older version holds the ports and says to reload the other windows. Two asks at most, then a warning, so a holder that agrees and keeps the port cannot cause a loop.
+
+The relay usage card groups models without regard to case, so `GLM-5.4` and `glm-5.4` count as one model. It also lists the 5-hour and weekly quota, each with its reset time, when the relay sends a `windows` list. A key with limits of its own shows those windows instead (5-hour, daily, weekly, monthly, total). A relay that sends no `windows` keeps the single credit-cap line. The panel footer still shows `2026-11-06`.
+
 ## 2.0.12 — 2026-11-26
 
 Relay mode shows "Est. Credits Used" again. The translation never sent Kiro's `meteringEvent` frame, so a relayed turn reported the elapsed time only. Each relay request now carries `x-gateway-usage: v1`. A relay that supports it appends one `gateway_usage` event with the request's charge to the end of the stream, and that charge is passed on to Kiro as the metering frame. A relay that does not support it is unaffected: the header is ignored and no frame is sent. The panel footer still shows `2026-11-06`.
